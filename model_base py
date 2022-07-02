@@ -1,0 +1,1037 @@
+Contains the ClassifierModel class. Which contains all the
+boilerplate code necessary to Create a tensorlfow graph, and training
+operations.
+"""
+import copy
+
+import tensorflow as tf
+import numpy as np
+import os
+import time
+import pickle
+import cv2
+from pathlib import Path
+
+from erfnet_tf.model_structure.classes_metadata import id2labelMulticlass
+from erfnet_tf.utils.viz import train_curves, batch2grid, vizseg, train_curves_n_lines, plot_class_curves
+from erfnet_tf.utils.data_processing import maybe_make_pardir, pickle2obj, obj2pickle, str2file  # ,load_batch_of_images
+
+# Convenient layer operation shortcuts
+fc = tf.contrib.layers.fully_connected
+conv = tf.contrib.layers.conv2d
+# convsep = tf.contrib.layers.separable_conv2d
+deconv = tf.contrib.layers.conv2d_transpose
+relu = tf.nn.relu
+maxpool = tf.contrib.layers.max_pool2d
+dropout_layer = tf.layers.dropout
+batchnorm = tf.contrib.layers.batch_norm
+# bn_params = {"is_training": is_training}
+winit = tf.contrib.layers.xavier_initializer()
+repeat = tf.contrib.layers.repeat
+arg_scope = tf.contrib.framework.arg_scope
+l2_regularizer = tf.contrib.layers.l2_regularizer
+
+
+# TODO: URGENT:  load_batch_of_images has not been implemented
+
+
+# ==============================================================================
+#                                                                    PRETTY_TIME
+# ==============================================================================
+def pretty_time(t):
+    """ Given a time in seconds, returns a string formatted as "HH:MM:SS" """
+    t = int(t)
+    H, r = divmod(t, 3600)
+    M, S = divmod(r, 60)
+    return "{:02n}:{:02n}:{:02n}".format(H, M, S)
+
+
+# ##############################################################################
+#                                                     IMAGE CLASSIFICATION MODEL
+# ##############################################################################
+def predict_single_frame_frozen(X, graph, session):
+    x_placeholder = graph.get_tensor_by_name('prefix/inputs/X:0')
+    is_training = graph.get_tensor_by_name('prefix/inputs/is_training:0')
+    preds = graph.get_tensor_by_name('prefix/preds:0')
+    # x_placeholder = graph.get_tensor_by_name('inputs/X:0')
+    # is_training = graph.get_tensor_by_name('inputs/is_training:0')
+    # preds = graph.get_tensor_by_name('preds:0')
+
+    # MAKE PREDICTIONS ON MINI BATCHES
+    feed_dict = {x_placeholder: X, is_training: False}
+    pred = session.run(preds, feed_dict=feed_dict)
+
+    return pred
+
+
+class ImageClassificationModel(object):
+    """
+    Examples:
+        # Creating a Model that inherits from this class:
+
+        class MyModel(ImageClassificationModel):
+            def __init__(self, name, img_shape, n_channels=3, n_classes=10, dynamic=False, l2=None, best_evals_metric="valid_acc"):
+                super().__init__(name=name, img_shape=img_shape, n_channels=n_channels, n_classes=n_classes, dynamic=dynamic, l2=l2, best_evals_metric=best_evals_metric)
+
+    """
+    evals_dict_keys = ["train_acc", "valid_acc", "train_loss", "valid_loss",
+                       'train_iou_class', 'valid_iou_class', "global_epoch",
+                       'train_avg_loss_per_class', 'valid_avg_loss_per_class']
+
+    # Lists of scopes of weights to include/exclude from main snapshot
+    main_include = None  # None includes all variables
+    main_exclude = None
+    class_weights = None  # assign class weights.
+
+    def __init__(self,
+                 name,
+                 img_shape,
+                 n_channels=3,
+                 n_classes=10,
+                 dynamic=False,
+                 l2=None,
+                 alpha=5e-4,
+                 batch_size=12,
+                 best_evals_metric="valid_acc",
+                 pretrained_snapshot=None,
+                 pretrained_include=None,
+                 pretrained_exclude=None,
+                 model_path='models',
+                 do_inference=False):
+        """ Initializes a Classifier Class
+            n_classes: (int)
+            dynamic: (bool)(default=False)
+                     Load the images dynamically?
+                     If the data just contains paths to image files, and not
+                     the images themselves, then set to True.
+
+            If logits_func is None, then you should create a new class that inherits
+            from this one that overides `self.body()`
+        """
+        # Print the model name
+        print(("#" * 60) + "\n" + name.upper() + "\n" + ("#" * 60) + "\n")
+
+        # MODEL SETTINGS
+        # TODO: Save the best evals metric to evals dict, and use that as the
+        #       default to load up if none is passed in argument.
+        self.batch_size = batch_size
+        self.alpha = alpha
+        self.best_evals_metric = best_evals_metric
+        self.l2 = l2
+        self.img_shape = img_shape
+        self.img_width, self.img_height = img_shape
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.dynamic = dynamic
+        self.global_epoch = 0
+        self.do_inference = True
+        self.model_name = name
+
+        # PRETRAINED MODEL SETTINGS
+        self.pretrained_model = False if pretrained_snapshot is None else True
+        self.pretrained_snapshot = pretrained_snapshot
+        # Lists of scopes of weights to include/exclude from pretrained snapshot
+        self.pretrained_include = pretrained_include
+        self.pretrained_exclude = pretrained_exclude
+
+        # IMPORTANT FILES
+        self.model_dir = os.path.join(model_path, name)
+        self.snapshot_file = os.path.join(self.model_dir, "snapshots", "snapshot.chk")
+        self.best_snapshot_file = os.path.join(self.model_dir, "snapshots_best", "snapshot.chk")
+        self.evals_file = os.path.join(self.model_dir, "evals.pickle")
+        self.best_score_file = os.path.join(self.model_dir, "best_score.txt")
+        self.train_status_file = os.path.join(self.model_dir, "train_status.txt")
+        self.tensorboard_dir = os.path.join(self.model_dir, "tensorboard")
+
+        # DIRECTORIES TO CREATE
+        self.dir_structure = [
+            self.model_dir,
+            os.path.join(self.model_dir, "snapshots"),
+            os.path.join(self.model_dir, "snapshots_best"),
+            os.path.join(self.model_dir, "tensorboard"),
+        ]
+
+        if not self.do_inference:
+            self.create_directory_structure()
+
+        # EVALS DICTIONARY
+        self.initialize_evals_dict(self.evals_dict_keys)
+        self.global_epoch = self.evals["global_epoch"]
+
+    def create_graph(self, logits_func=None, verbose=False):
+        """ Creates the graph.
+
+            If a logits function is passed, then it should have the the
+            following API:
+
+                `logits_func(X, Y, n_classes, alpha, dropout, l2, is_training)`
+                Returning: `logits`
+
+                NOTE: that the argument names are what is important, not the
+                ordering.
+                NOTE: Each of the arguments passed to the logits_func is a
+                placeholder.
+
+        Then it creates the full graph for the model.
+        """
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            self.create_input_ops()
+            if logits_func is not None:
+                self.logits = logits_func(X=self.X, Y=self.Y, n_classes=self.n_classes, alpha=self.alpha,
+                                          dropout=self.dropout, l2=self.l2_scale, is_training=self.is_training)
+            else:
+                raise ValueError('logits_func must be defined')
+            self.create_preds_op()
+            self.create_loss_ops()
+            self.create_optimization_ops()
+            self.create_evaluation_metric_ops()
+            self.create_saver_ops()
+
+            if not self.do_inference:
+                self.create_tensorboard_ops()
+
+        if verbose:
+            self.print_model_summary()
+
+    def create_input_ops(self):
+        # TODO: This handling of L2 is ugly, fix it.
+        if self.l2 is None:
+            l2_scale = 0.0
+        else:
+            l2_scale = self.l2
+
+        with tf.variable_scope("inputs"):
+            self.X = tf.placeholder(tf.float32, shape=(None, self.img_height, self.img_width, self.n_channels),
+                                    name="X")  # [batch, rows, cols, chanels]
+            self.Y = tf.placeholder(tf.int32, shape=[None], name="Y")  # [batch]
+            self.alpha = tf.placeholder_with_default(0.001, shape=None, name="alpha")
+            self.is_training = tf.placeholder_with_default(False, shape=(), name="is_training")
+            self.l2_scale = tf.placeholder_with_default(l2_scale, shape=(), name="l2_scale")
+            self.dropout = tf.placeholder_with_default(0.0, shape=None, name="dropout")
+
+    def create_preds_op(self):
+        # PREDUCTIONS - get a class value for each sample
+        with tf.name_scope("preds") as scope:
+            self.preds = tf.to_int32(tf.argmax(self.logits, axis=-1), name=scope)
+            self.probs = tf.nn.softmax(self.logits, name="probs")  # probability distributions
+
+    def create_evaluation_metric_ops(self):
+        # EVALUATION METRIC
+        with tf.name_scope("evaluation") as scope:
+            # Define the evaluation metric and update operations
+            #
+            # update variables means basically:
+            # N_CORRECT += (batch_labels == batch_predictions).sum()
+            # N_ITEMS_SEEN += batch_labels.size.
+            # It must be done every time an evaluation is done.
+            #
+            # Resetting the variables means to put them to zero
+            self.evaluation, self.update_evaluation_vars = tf.metrics.accuracy(
+                labels=tf.reshape(self.Y, [-1]),
+                predictions=tf.reshape(self.preds, [-1]),
+                name=scope)
+
+            # Isolate metric's running variables & create their initializer/reset op
+            evaluation_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope=scope)
+            self.reset_evaluation_vars = tf.variables_initializer(var_list=evaluation_vars)
+
+    def set_class_weights(self, w):
+        self.class_weights = w
+        # TODO: make it handle case where graph has already been created,
+        #       so make it recreate the loss_ops if graph exists.
+
+    def create_loss_ops(self):
+        with tf.variable_scope('loss') as scope:
+            unrolled_logits = tf.reshape(self.logits, (-1, self.n_classes))
+            unrolled_labels = tf.reshape(self.Y, (-1,))
+
+            # HANDLE CLASS WEIGHTS
+            if self.class_weights is not None:
+                class_weights_tensor = tf.constant(self.class_weights, dtype=tf.float32)
+                label_weights = tf.gather(class_weights_tensor, indices=unrolled_labels)
+                print("- Using Class Weights: \n", self.class_weights)
+            else:
+                label_weights = 1.0
+                print("- Using uniform Class Weights of 1.0")
+
+            with tf.variable_scope('loss_train') as scope:
+                # CACLULATE LOSSES
+                tf.losses.sparse_softmax_cross_entropy(labels=unrolled_labels, logits=unrolled_logits,
+                                                       weights=label_weights,
+                                                       reduction="weighted_sum_by_nonzero_weights")
+
+                # SUMS ALL LOSSES - even Regularization losses automatically
+                self.loss = tf.losses.get_total_loss()
+
+            with tf.variable_scope('loss_y') as scope:
+                self.loss_y = tf.losses.sparse_softmax_cross_entropy(labels=unrolled_labels, logits=unrolled_logits,
+                                                                     weights=label_weights,
+                                                                     reduction=tf.losses.Reduction.NONE)
+
+    # def create_expand_dim_ops(self):
+    #     with tf.variable_scope('loss_per_image') as scope:
+    #         preds_expanded_dim = tf.expand_dims(self.X, axis=0)
+    #         label_expanded_dim = tf.expand_dims(self.Y, axis=0)
+    #
+    #         # HANDLE CLASS WEIGHTS
+    #         if self.class_weights is not None:
+    #             class_weights_tensor = tf.constant(self.class_weights, dtype=tf.float32)
+    #             label_weights = tf.gather(class_weights_tensor, indices=unrolled_labels)
+    #             print("- Using Class Weights: \n", self.class_weights)
+    #         else:
+    #             label_weights = 1.0
+    #             print("- Using uniform Class Weights of 1.0")
+    #
+    #         tf.losses.sparse_softmax_cross_entropy(labels=preds_expanded_dim, logits=label_expanded_dim,
+    #                                                weights=label_weights,
+    #                                                reduction="weighted_sum_by_nonzero_weights")
+    #
+    #         # SUMS ALL LOSSES - even Regularization losses automatically
+    #         self.loss_img = tf.losses.get_total_loss()
+
+    def create_optimization_ops(self):
+        # OPTIMIZATION - Also updates batchnorm operations automatically
+        with tf.variable_scope('opt') as scope:
+            self.optimizer = tf.train.AdamOptimizer(self.alpha, name="optimizer")
+            update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)  # allow batchnorm
+            with tf.control_dependencies(update_ops):
+                self.train_op = self.optimizer.minimize(self.loss, name="train_op")
+
+    def create_tensorboard_ops(self):
+        # # TENSORBOARD
+        # self.summary_writer = tf.summary.FileWriter(os.path.join(self.model_dir, "tensorboard"), graph=self.graph)
+        # self.summary_op = tf.summary.scalar(name="dummy", tensor=4)
+
+        # TENSORBOARD - To visialize the architecture
+        with tf.variable_scope('tensorboard') as scope:
+            self.summary_writer = tf.summary.FileWriter(self.tensorboard_dir, graph=self.graph)
+            self.dummy_summary = tf.summary.scalar(name="dummy", tensor=1)
+            # self.summary_op = tf.summary.merge_all()
+
+    def create_saver_ops(self):
+        """ Create operations to save/restore model weights """
+        if self.pretrained_model:
+            self.pretrained_saver_ops()
+
+        with tf.device('/cpu:0'):  # prevent more than one thread doing file I/O
+            # Main Saver
+            self.main_exclude = None
+            main_vars = tf.contrib.framework.get_variables_to_restore(exclude=self.main_exclude)
+            self.saver = tf.train.Saver(main_vars, name="saver")
+
+    def pretrained_saver_ops(self):
+        """ Create operations to save/restore model weights """
+        with tf.device('/cpu:0'):  # prevent more than one thread doing file I/O
+            # PRETRAINED SAVER
+            self.pretrained_vars = tf.contrib.framework.get_variables_to_restore(include=self.pretrained_include,
+                                                                                 exclude=self.pretrained_exclude)
+            self.pretrained_saver = tf.train.Saver(self.pretrained_vars, name="pretrained_saver")
+
+            # REMAINDER INITIALIZER - all others not handled by pretrained snapshot
+            self.remainder_vars = tf.contrib.framework.get_variables_to_restore(
+                exclude=[var.name for var in self.pretrained_vars])
+            self.remainder_initializer = tf.variables_initializer(var_list=self.remainder_vars)
+
+    def print_model_summary(self):
+        print("MODEL PARAMETERS")
+        template = "- {name:<30}:  {params: 8d} parameters. {shape}"
+        total_params = 0
+        with self.graph.as_default():
+            vars = tf.trainable_variables()
+            for var in vars:
+                shape = var.shape.as_list()
+                n_params = np.prod(shape)
+                total_params += n_params
+                print(template.format(name=var.name, params=n_params, shape=shape))
+        print("- TOTAL PARAMETERS:", total_params)
+
+    def create_directory_structure(self):
+        """ Ensure the necessary directory structure exists for saving this model """
+        for dir in self.dir_structure:
+            if not os.path.exists(dir):
+                os.makedirs(dir)
+
+    def initialize_evals_dict(self, keys):
+        """ If evals file exists, load it, otherwise create one from scratch.
+            You should specify the keys you want to use in the dict."""
+        if os.path.exists(self.evals_file):
+            print("- Loading previosuly saved evals file from: \n- ", self.evals_file)
+            with open(self.evals_file, mode="rb") as fileObj:
+                self.evals = pickle.load(fileObj)
+        else:
+            self.evals = {key: [] for key in keys}
+            self.evals["global_epoch"] = 0
+
+    def save_evals_dict(self):
+        """ Save evals dict to a picle file in models root directory """
+        with open(self.evals_file, mode="wb") as fileObj:
+            self.evals["global_epoch"] = self.global_epoch
+            pickle.dump(self.evals, fileObj, protocol=2)  # py2.7 & 3.x compatible
+
+    def snapshot_exists(self, snapshot_file):
+        """ Check if a snapshot file exists.
+            Designed to overcome a bug/limitation of tensroflows function
+            for checking if snapshot exists. In the case where even the
+            directory does not exist, here it gracefully returns False,
+            instead of throwing an error.
+        """
+        return os.path.exists(os.path.dirname(snapshot_file)) \
+               and tf.train.checkpoint_exists(snapshot_file)
+
+    def initialize_vars(self, session, best=False):
+        """ Override this if you set up custom savers """
+        # Determine if to use best, or latest snapshot
+        if best:
+            snapshot_file = self.best_snapshot_file
+        else:
+            snapshot_file = self.snapshot_file
+
+        try:
+            # Determine if it can continue training from a previous run,
+            # or if it needs to be intialized from the begining.
+            if self.snapshot_exists(snapshot_file):
+                print("- Restoring parameters from saved snapshot")
+                print("  -", snapshot_file)
+                self.saver.restore(session, snapshot_file)
+            elif self.pretrained_model:
+                snapshot_file = self.pretrained_snapshot
+                print("- Initializing from Pretrained Weights")
+                print("  -", snapshot_file)
+                print("- initialising the following variables from pretrained snapshot: ")
+                for var in self.pretrained_vars:
+                    print("  -", var.name)
+                assert self.snapshot_exists(snapshot_file), \
+                    "The pretrained weights file does not exist: \n- " \
+                    + str(snapshot_file)
+                self.pretrained_saver.restore(session, snapshot_file)
+
+                print("- And initializing the remaining variables from scratch")
+                session.run(self.remainder_initializer)
+            else:
+                print("- Initializing to new parameter values")
+                session.run(tf.global_variables_initializer())
+        except (tf.errors.InvalidArgumentError, tf.errors.NotFoundError) as e:
+            msg = "===================================================\n" \
+                  "ERROR IN INITIALIZING VARIABLES FROM SNAPSHOTS FILE\n" \
+                  "===================================================\n" \
+                  "Something went wrong  in  loading   the  parameters\n" \
+                  "from  the snapshot. This  is  most  likely  due  to\n" \
+                  "changes  being  made   to  the   model,   but   not\n" \
+                  "changing   the   snapshots   file   path.   Loading\n" \
+                  "from a  snapshot  requires  that   the   model   is\n" \
+                  "still exaclty the same since the last  time it  was\n" \
+                  "saved.\n" \
+                  "However, it could also be that the path to the\n" \
+                  "snapshot file is incorect.\n" \
+                  "\n" \
+                  "Either:\n" \
+                  "- Check the filepath to the snapshot is correct.\n" \
+                  "- Use a different snapshots filepath to create\n" \
+                  "new snapshots for this model. \n" \
+                  "- or, Delete the old snapshots manually from the \n" \
+                  "computer.\n" \
+                  "Once you have done that, try again.  See the full\n" \
+                  "printout and traceback above  if  this  did  not\n" \
+                  "resolve the issue.\n" \
+                  "===================================================\n" \
+                  "SNAPSHOT FILE: \n" + str(snapshot_file)
+            raise ValueError(str(e) + "\n\n\n" + msg)
+
+    def save_snapshot_in_session(self, session, file):
+        """Given an open session, it saves a snapshot of the weights to file"""
+        # Create the directory structure for parent directory of snapshot file
+        if not os.path.exists(os.path.dirname(file)):
+            os.makedirs(os.path.dirname(file))
+        self.saver.save(session, file)
+
+    def shuffle_train_data(self, data):
+        n_samples = len(data["Y_train"])
+        permutation = list(np.random.permutation(n_samples))
+        data["X_train"] = data["X_train"][permutation]
+        data["Y_train"] = data["Y_train"][permutation]
+        return data
+
+    def shuffle_train_index(self, data, n_perms=1):
+        n_samples = len(data["Y_train"])
+
+        permutations = []
+
+        for _ in range(n_perms):
+            permutations += list(np.random.permutation(n_samples))
+
+        return permutations
+
+    def get_batch(self, i, batch_size, X, Y=None):
+        """ Get the ith batch from the data."""
+        X_batch = X[batch_size * i: batch_size * (i + 1)]
+
+        # Batch of labels if needed
+        if Y is not None:
+            Y_batch = Y[batch_size * i: batch_size * (i + 1)]
+            return X_batch, Y_batch
+        else:
+            return X_batch
+
+    def get_batch_from_indeces(self, i, data, indeces, batch_size):
+        """ Get the ith batch from the data."""
+        X_batch = data['X_train'][indeces[batch_size * i: batch_size * (i + 1)]]
+
+        # Batch of labels if needed
+        if data['Y_train'] is not None:
+            Y_batch = data['Y_train'][indeces[batch_size * i: batch_size * (i + 1)]]
+            return X_batch, Y_batch
+        else:
+            return X_batch
+
+    def update_status_file(self, status):
+        str2file(status, file=self.train_status_file)
+
+    def update_evals_dict(self, **kwargs):
+        """ Appends a new value to the specified key/s in the evals dictionary
+            eg: update_evals_dict(valid_acc=0.95, valid_loss=0.341)
+            will append the value 0.95 to the end of self.evals["valid_acc"]
+            and 0.341 to the end of self.evals["valid_loss"] """
+        for key in kwargs:
+            self.evals[key].append(kwargs[key])
+
+    def predict_single_frame_frozen(self, X, graph, session):
+        x_placeholder = graph.get_tensor_by_name('prefix/inputs/X:0')
+        is_training = graph.get_tensor_by_name('prefix/inputs/is_training:0')
+        preds = graph.get_tensor_by_name('prefix/preds:0')
+        # x_placeholder = graph.get_tensor_by_name('inputs/X:0')
+        # is_training = graph.get_tensor_by_name('inputs/is_training:0')
+        # preds = graph.get_tensor_by_name('preds:0')
+
+        # MAKE PREDICTIONS ON MINI BATCHES
+        feed_dict = {x_placeholder: X, is_training: False}
+        pred = session.run(preds, feed_dict=feed_dict)
+
+        return pred
+
+    def predict_single_frame(self, X, session):
+
+        # MAKE PREDICTIONS ON MINI BATCHES
+
+        feed_dict = {self.X: X, self.is_training: False}
+        pred = session.run(self.preds, feed_dict=feed_dict)
+
+        return pred
+
+    def predict_in_session(self, X, session, batch_size=32, probs=False, verbose=True):
+        """ Make predictions on data `X` within a currently running session.
+            Returns the most likely class id for each training sample in `X`.
+            You can optionally return the probability distribution for all
+            the classes instead by setting `probs=True`
+
+        Args:
+            X:              (np array) inputs
+            session:        (tensroflow session) Currently running session.
+            batch_size:     (int)(default=32)
+            probs:          (bool)(default=False) If set to `True` it returns
+                            the probability distribution of each class instead
+                            of the id of the most likely class.
+            verbose:        (bool)(default=True) If `True`, it prints out
+                            progress.
+        """
+        # Dimensions
+        n_samples = X.shape[0]
+        n_batches = int(np.ceil(n_samples / batch_size))
+        out_sample_shape = self.Y.shape.as_list()[1:]
+        if probs:
+            preds = np.zeros([n_samples] + out_sample_shape + [self.n_classes], dtype=np.float32)
+            op = self.probs
+        else:
+            preds = np.zeros([n_samples] + out_sample_shape, dtype=np.uint8)
+            op = self.preds
+        if verbose:
+            print("MAKING PREDICTIONS")
+            percent_interval = 10
+            print_every = n_batches / percent_interval
+            percent = 0
+
+        # MAKE PREDICTIONS ON MINI BATCHES
+        for i in range(n_batches):
+            X_batch = self.get_batch(i, batch_size=batch_size, X=X)
+            feed_dict = {self.X: X_batch, self.is_training: False}
+            batch_preds = session.run(op, feed_dict=feed_dict)
+            preds[batch_size * i: batch_size * (i + 1)] = batch_preds.squeeze()
+
+        return preds
+
+    def evaluate(self, X, Y, batch_size=32, best=False):
+        """Given input X, and Labels Y, evaluate the accuracy of the model"""
+        with tf.Session(graph=self.graph) as sess:
+            self.initialize_vars(sess, best=best)
+            return self.evaluate_in_session(X, Y, sess, batch_size=batch_size)
+
+    def compute_loss_per_class(self, Y, losses):
+        present_in_batch = [False] * self.n_classes
+        unrolled_labels = Y.reshape(-1)
+        assert len(unrolled_labels) == len(losses)
+
+        loss_per_class = []
+        for class_id in range(self.n_classes):
+            class_mask = unrolled_labels == class_id
+            if class_mask.sum() == 0:
+                loss_per_class.append(0)
+            else:
+                # weighted mean
+                norm = self.class_weights[class_id] * len(losses[class_mask])
+                mean_class_loss = losses[class_mask].sum() / norm
+                loss_per_class.append(mean_class_loss)
+                present_in_batch[class_id] = True
+
+        return np.array(loss_per_class), np.array(present_in_batch)
+
+    def evaluate_in_session(self, X, Y, session, batch_size=32):
+        """Evaluate the model on some data (does it in batches).
+           Returns a tuple (score, avg_loss)
+        """
+        # Iterate through each mini-batch
+        total_loss = 0
+        loss_per_class = np.zeros(self.n_classes)
+        n_samples = len(Y)
+        n_batches = int(np.ceil(n_samples / batch_size))  # Num batches needed
+
+        # Reset the running variables for evaluation metric
+        session.run(self.reset_evaluation_vars)
+        confusion_mtx = None
+        times_class_in_batch = np.zeros(self.n_classes)
+
+        for i in range(n_batches):
+            X_batch, Y_batch = self.get_batch(i, batch_size=batch_size, X=X, Y=Y)
+            feed_dict = {self.X: X_batch, self.Y: Y_batch, self.is_training: False}
+
+            # to have the updated value of accuracy (self.evaluation result) we need to call before self.update_eval
+            loss, preds, confusion_mtx = session.run([self.loss, self.preds, self.update_evaluation_vars],
+                                                     feed_dict=feed_dict)
+
+            losses = np.array(session.run([self.loss_y], feed_dict=feed_dict)[0])
+            loss_per_class_batch, present_in_batch = self.compute_loss_per_class(Y_batch, losses)
+            loss_per_class += loss_per_class_batch
+            times_class_in_batch += present_in_batch
+            total_loss += loss
+
+        total_elem_per_class = confusion_mtx.sum(axis=0)
+        tp_per_class = np.diag(confusion_mtx)
+        iou_per_class = tp_per_class / total_elem_per_class
+
+        total_elem = total_elem_per_class.sum()
+        background_tp = tp_per_class[0]
+        foreground_tp = confusion_mtx[1:, 1:].sum()
+        backg_forg_iou = (background_tp + foreground_tp) / total_elem
+        print(f'Background-Foreground IOU: {backg_forg_iou:.2f}')
+
+        score = session.run(self.evaluation)
+        avg_loss = total_loss / float(n_batches)
+        avg_loss_per_class = loss_per_class / times_class_in_batch
+        # avg_loss_per_class = loss_per_class / float(n_batches)
+        mean_from_loss_per_class = avg_loss_per_class.mean()
+        return score, avg_loss, iou_per_class, avg_loss_per_class
+
+    def evaluate_in_session_per_class(self, X, Y, session, batch_size=32):
+        """Evaluate the model on some data (does it in batches).
+           Returns a tuple (score, avg_loss)
+        """
+        # Iterate through each mini-batch
+        total_loss = 0
+        n_samples = len(Y)
+        n_batches = int(np.ceil(n_samples / batch_size))  # Num batches needed
+        score_per_class = []
+        loss_per_class = []
+
+        # Reset the running variables for evaluation metric
+        session.run(self.reset_evaluation_vars_per_class)
+        class_ids = np.unique(Y)
+
+        for class_id in class_ids:
+            class_mask = Y == class_id
+            X_class = X[class_mask]
+            Y_class = Y[class_mask]
+
+            for i in range(n_batches):
+                X_batch, Y_batch = self.get_batch(i, batch_size=batch_size, X=X_class, Y=Y_class)
+                feed_dict = {self.X: X_batch, self.Y: Y_batch, self.is_training: False}
+
+                # to have the updated value of accuracy (self.evaluation result) we need to call before self.update_eval
+                loss, preds, confusion_mtx = session.run([self.loss, self.preds, self.update_eval_vars_per_class],
+                                                         feed_dict=feed_dict)
+                total_loss += loss
+
+            loss_per_class.append(total_loss)
+
+        score = session.run(self.eval_per_class)
+        avg_loss = total_loss / float(n_batches)
+        return score, avg_loss
+
+
+# ==============================================================================
+#                                                       GRAPH_FROM_GRAPHDEF_FILE
+# ==============================================================================
+def graph_from_graphdef_file(graph_file, access_these, remap_input=None):
+    """ Given a tensorflow GraphDef (*.pb) file, it loads up the
+        graph specified by that file.
+
+        You need to specify which operations or tensors you want
+        to get access to directly by passing a list of the
+        operation or tensor names you want to get access to.
+
+        You can also replace the original input tensor
+        in the graph with your own tensor.
+
+    Args:
+        graph_file:   (str) Path to the GraphDef (*.pb) file
+        access_these: (list of strings) A list of all the tensor
+                      names you wish to extract. The tensor names
+                      MUST EXACTLY match tensor names in the graph.
+        remap_input: (dict) Swap out the input tensor in the graph
+                     with your own tensor object.
+                     A dictionary:
+                     - Key is a string of the input tensor name within the
+                       saved graph you are loading.
+                     - Value is the new tensor object you want
+                        to use as the new input to the saved graph instead.
+                    Eg:
+                        {"input:0": MyPlaceholder}
+
+    Returns: (list)
+        requested_ops: List of tensorflow operations or tensor objects
+                       that were retreived by the names specified in the
+                       `access_these` list.
+
+        NOTE: the remapped input tensor is not returned, as it is
+              already a tensor you have access to (since you created
+              it outside the function)
+    """
+    with tf.device('/cpu:0'):  # Prevent multiple prallel I/O operations
+        with tf.gfile.FastGFile(graph_file, 'rb') as file_obj:
+            # Load the graph from file
+            graph_def = tf.GraphDef()
+            graph_def.ParseFromString(file_obj.read())
+
+    # Extract particular operations/tensors
+    requested_ops = tf.import_graph_def(
+        graph_def,
+        name='',
+        return_elements=access_these,
+        input_map=remap_input)
+    return requested_ops
+
+
+# ==============================================================================
+#                                                       SEGMENT IMAGE FROZEN
+# ==============================================================================
+def segment_image_bgr_frozen(original_frame, extractor, idcolormap, sess):
+    frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+    frame = frame.reshape((1, frame.shape[0], frame.shape[1], frame.shape[2]))
+
+    # Apply colormap to Y and Y2
+    frame = predict_single_frame_frozen(X=frame, session=sess, graph=extractor.graph)
+    x = np.array(idcolormap)
+    frame = x[frame].astype(np.uint8)
+
+    frame = np.uint8(frame)
+    frame = frame.squeeze()
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+
+# ==============================================================================
+#                                                             SEGMENTATION MODEL
+# ==============================================================================
+def init_segmentation_model(config, graph_type):
+
+    model_path = config['model_path']
+    model_name = config["modelName"]
+    shape = config['shape']
+    width = shape[0]
+    height = shape[1]
+    n_classes = config["nClasses"]
+    l2_value = config['l2']
+
+    extractor = SegmentationModel(model_name,
+                                  img_shape=[width, height],
+                                  n_classes=n_classes,
+                                  l2=l2_value,
+                                  model_path=model_path)
+    extractor.create_graph(graph_type)
+
+    return extractor
+
+
+class SegmentationModel(ImageClassificationModel):
+    evals_dict_keys = ["train_iou", "valid_iou", "train_loss", "valid_loss", "global_epoch",
+                       'train_iou_class', 'valid_iou_class',
+                       'train_avg_loss_per_class', 'valid_avg_loss_per_class']
+
+    def __init__(self,
+                 name,
+                 img_shape=[299, 299],
+                 n_channels=3,
+                 n_classes=10,
+                 dynamic=False,
+                 l2=None,
+                 alpha=1e-4,  # 5e-4
+                 batch_size=12,
+                 best_evals_metric="valid_iou",
+                 pretrained_snapshot=None,
+                 pretrained_include=None,
+                 pretrained_exclude=None,
+                 model_path='models',
+                 do_inference=False):
+        """ """
+        # PASS THE ARGUMENTS TO THE PARENT CLASS
+        kwargs = copy.deepcopy(locals())
+        del kwargs["self"]
+        del kwargs["__class__"]
+        super().__init__(**kwargs)
+
+        # SETTINGS SPECIFIC TO SEGMENTATION
+        # TODO: Have an option to ignore void class irrespective of
+        # number of total classes.
+        if n_classes == 1:
+            # technically 1 class is actually two classes (A or not A)
+            # But IoU will get calculated differently, so set to single
+            # class mode.
+            self.n_classes = 2
+            self.single_class_mode = True
+        else:
+            self.n_classes = n_classes
+            self.single_class_mode = False
+
+        if not self.do_inference:
+            self.write_params_settings()
+
+    def write_params_settings(self):
+        modeltxtpath = Path(self.model_dir) / 'exp_settings.txt'
+        if not os.path.exists(modeltxtpath):  # dont add first line if it exists
+            with open(modeltxtpath, "w") as myfile:
+                myfile.write(str(
+                    f'batch_size: {self.batch_size}\nalpha: {self.alpha}\n'
+                    f'l2: {self.l2}\nshape: {self.img_shape}'
+                ))
+        else:
+            print('ATTENTION: exp_settings.txt file already exists.')
+
+    def create_input_ops(self):
+        # TODO: This handling of L2 is ugly, fix it.
+        if self.l2 is None:
+            l2_scale = 0.0
+        else:
+            l2_scale = self.l2
+
+        with tf.variable_scope("inputs"):
+            self.X = tf.placeholder(tf.float32, shape=(None, self.img_height, self.img_width, self.n_channels),
+                                    name="X")  # [batch, rows, cols, chanels]
+            self.Y = tf.placeholder(tf.int32, shape=(None, self.img_height, self.img_width), name="Y")  # [batch]
+            self.alpha = tf.placeholder_with_default(0.001, shape=None, name="alpha")
+            self.is_training = tf.placeholder_with_default(False, shape=(), name="is_training")
+            self.l2_scale = tf.placeholder_with_default(l2_scale, shape=(), name="l2_scale")
+            self.dropout = tf.placeholder_with_default(0.0, shape=None, name="dropout")
+
+    def create_evaluation_metric_ops(self):
+        # EVALUATION METRIC - IoU
+        with tf.name_scope("evaluation") as scope:
+            # Define the evaluation metric and update operations
+            self.evaluation, self.update_evaluation_vars = tf.metrics.mean_iou(
+                tf.reshape(self.Y, [-1]),
+                tf.reshape(self.preds, [-1]),
+                num_classes=self.n_classes,
+                name=scope)
+            # Isolate metric's running variables & create their initializer/reset op
+            evaluation_vars = tf.get_collection(tf.GraphKeys.LOCAL_VARIABLES, scope=scope)
+            self.reset_evaluation_vars = tf.variables_initializer(var_list=evaluation_vars)
+
+    def topk_worse_imgs(self, session, imgs, labels, k=16):
+        """
+        Compute the topK worse images index. The order is obtained using the loss
+        as evalution metric.
+
+        Args:
+            session: context in which to operate
+            imgs: input images
+            labels: training labels
+            k: number of sorted indexes to return
+
+        Returns: 1D tensor with the sorted indexes
+
+        """
+        losses = []
+        for img, label in zip(imgs, labels):
+            img = np.expand_dims(img, axis=0)
+            label = np.expand_dims(label, axis=0)
+            losses.append(session.run(self.loss, {self.X: img, self.Y: label, self.is_training: False}))
+
+        losses = np.array(losses)
+        topk_indeces = losses.argsort()[-k:][::-1]
+
+        return topk_indeces
+
+    def train(self, data, n_epochs, n_perm=1, alpha=0.001, dropout=0.0, batch_size=32, print_every=10, l2=None,
+              aug_func=None, viz_every=10, worse_pred=False):
+        """Trains the model, for n_epochs given a dictionary of data"""
+
+        n_samples = len(data["X_train"])  # Num training samples
+        n_batches = int(np.ceil((n_samples * n_perm) / batch_size))  # Num batches per epoch
+
+        # init Keras session
+        session_conf = tf.ConfigProto(intra_op_parallelism_threads=1,
+                                      inter_op_parallelism_threads=1, log_device_placement=True)
+
+        print("- ", "using aug func" if aug_func is not None else "NOT using aug func")
+        with tf.Session(graph=self.graph, config=session_conf) as sess:
+            self.initialize_vars(sess)
+            t0 = time.time()
+
+            try:
+                self.update_status_file("training")
+                for epoch in range(1, n_epochs + 1):
+                    self.global_epoch += 1
+                    print("=" * 70, "\nEPOCH {}/{} (GLOBAL_EPOCH: {})        ELAPSED TIME: {}".format(epoch, n_epochs,
+                                                                                                      self.global_epoch,
+                                                                                                      pretty_time(
+                                                                                                          time.time() - t0)),
+                          "\n" + ("=" * 70))
+
+                    # Shuffle the data
+                    # data = self.shuffle_train_data(data)
+
+                    indeces = self.shuffle_train_index(data, n_perms=n_perm)
+
+                    # Iterate through each mini-batch
+                    for i in range(n_batches):
+
+                        X_batch, Y_batch = self.get_batch_from_indeces(i, data, indeces, batch_size=batch_size)
+
+                        if aug_func is not None:
+                            X_batch, Y_batch = aug_func(X_batch, Y_batch)
+
+                        # TRAIN
+                        feed_dict = {self.X: X_batch, self.Y: Y_batch, self.alpha: alpha, self.is_training: True,
+                                     self.dropout: dropout}
+                        loss, _ = sess.run([self.loss, self.train_op], feed_dict=feed_dict)
+
+                        # Print feedback every so often
+                        if print_every is not None and (i + 1) % print_every == 0:
+                            print("{} {: 5d} Batch_loss: {}".format(pretty_time(time.time() - t0), i, loss))
+
+                    # Save parameters after each epoch
+                    self.save_snapshot_in_session(sess, self.snapshot_file)
+
+                    # Evaluate on full train and validation sets after each epoch
+                    train_iou, train_loss, \
+                    train_iou_class, train_avg_loss_per_class = self.evaluate_in_session(data["X_train"],
+                                                                                         data["Y_train"], sess,
+                                                                                         batch_size=batch_size)
+                    valid_iou, valid_loss, \
+                    valid_iou_class, valid_avg_loss_per_class = self.evaluate_in_session(data["X_valid"],
+                                                                                         data["Y_valid"], sess,
+                                                                                         batch_size=batch_size)
+                    self.update_evals_dict(train_iou=train_iou, train_loss=train_loss,
+                                           valid_iou=valid_iou, valid_loss=valid_loss,
+                                           train_avg_loss_per_class=train_avg_loss_per_class,
+                                           valid_avg_loss_per_class=valid_avg_loss_per_class,
+                                           train_iou_class=train_iou_class,
+                                           valid_iou_class=valid_iou_class)
+                    self.save_evals_dict()
+
+                    # If its the best model so far, save best snapshot
+                    is_best_so_far = self.evals[self.best_evals_metric][-1] >= max(self.evals[self.best_evals_metric])
+                    if is_best_so_far:
+                        self.save_snapshot_in_session(sess, self.best_snapshot_file)
+
+                    # Print evaluations (with asterix at end if it is best model so far)
+                    s = "TR IOU: {: 3.3f} VA IOU: {: 3.3f} TR LOSS: {: 3.5f} VA LOSS: {: 3.5f} {}\n"
+                    print(s.format(train_iou, valid_iou, train_loss, valid_loss, "*" if is_best_so_far else ""))
+
+                    # # TRAIN CURVES
+                    # If multi-class segmentation
+                    if self.n_classes > 2:
+                        train_curves_n_lines(points=self.evals['train_iou_class'],
+                                             saveto=os.path.join(self.model_dir, "iou_class_train.png"),
+                                             title="IoU per class train",
+                                             ylab="IoU", legend_pos="lower right")
+                        train_curves_n_lines(points=self.evals['valid_iou_class'],
+                                             saveto=os.path.join(self.model_dir, "iou_class_valid.png"),
+                                             title="IoU per class valid",
+                                             ylab="IoU", legend_pos="lower right")
+
+                        train_curves_n_lines(points=self.evals['train_avg_loss_per_class'],
+                                             saveto=os.path.join(self.model_dir, "loss_class_train.png"),
+                                             title="Loss per class train",
+                                             ylab="Loss", legend_pos="lower right")
+                        train_curves_n_lines(points=self.evals['valid_avg_loss_per_class'],
+                                             saveto=os.path.join(self.model_dir, "loss_class_valid.png"),
+                                             title="Loss per class valid",
+                                             ylab="Loss", legend_pos="lower right")
+
+                        plot_class_curves(self.evals, self.n_classes, self.model_dir)
+
+                    train_curves(train=self.evals["train_iou"], valid=self.evals["valid_iou"],
+                                 saveto=os.path.join(self.model_dir, "iou.png"), title="IoU over time",
+                                 ylab="IoU", legend_pos="lower right")
+                    train_curves(train=self.evals["train_loss"], valid=self.evals["valid_loss"],
+                                 saveto=os.path.join(self.model_dir, "loss.png"), title="Loss over time",
+                                 ylab="loss", legend_pos="upper right")
+
+                    # VISUALIZE PREDICTIONS - once every so many epochs
+                    if self.global_epoch % viz_every == 0:
+                        self.visualise_semgmentations(data=data, session=sess, worse_pred=worse_pred)
+
+                    str2file(str(max(self.evals[self.best_evals_metric])), file=self.best_score_file)
+                self.update_status_file("done")
+                print("DONE in ", pretty_time(time.time() - t0))
+
+            except KeyboardInterrupt as e:
+                print("Keyboard Interupt detected")
+                # TODO: Finish up gracefully. Maybe create recovery snapshots of model
+                self.update_status_file("interupted")
+                raise e
+            except:
+                self.update_status_file("crashed")
+                raise
+
+    def visualise_semgmentations(self, data, session, shape=[2, 8], worse_pred=False):
+        # TODO: URGENT: Make this function dynamic data loading friendly
+        viz_rows, viz_cols = shape
+        n_viz = viz_rows * viz_cols
+        viz_img_template = os.path.join(self.model_dir, "samples", "{}", "epoch_{:07d}.jpg")
+
+        # On train data
+        preds = self.predict_in_session(data["X_train_viz"][:n_viz], session=session, batch_size=self.batch_size,
+                                        verbose=False)
+        vizseg(
+            img=data["X_train_viz"][:n_viz],
+            label=data["Y_train_viz"][:n_viz],
+            pred=preds[:n_viz],
+            colormap=data.get("colormap", None),
+            gridshape=shape,
+            saveto=viz_img_template.format("train", self.global_epoch)
+        )
+
+        # Choose if to visualize worse predicted validation samples or just the first n_viz
+        if worse_pred:
+            # On train data
+            # preds_valid = self.predict_in_session(data["X_valid"], session=session, batch_size=self.batch_size,
+            #                                       verbose=False)
+            sorted_indexes = self.topk_worse_imgs(session, data['X_valid'], data["Y_valid"], k=n_viz)
+            X_valid_to_viz = data["X_valid"][sorted_indexes]
+            Y_valid_to_viz = data["Y_valid"][sorted_indexes]
+            # preds_to_viz = preds_valid[sorted_indexes]
+
+        else:
+
+            X_valid_to_viz = data["X_valid"][:n_viz]
+            Y_valid_to_viz = data["Y_valid"][:n_viz]
+
+        preds_to_viz = self.predict_in_session(X_valid_to_viz, session=session, batch_size=self.batch_size,
+                                               verbose=False)
+
+        vizseg(
+            img=X_valid_to_viz,
+            label=Y_valid_to_viz,
+            pred=preds_to_viz,
+            colormap=data.get("colormap", None),
+            gridshape=shape,
+            saveto=viz_img_template.format("valid", self.global_epoch)
+        )
