@@ -1,0 +1,148 @@
+import cv2
+import numpy as np
+
+label_colormap_multiclass = {
+    "Background": (0, 0, 0),  # Black
+    "Hub": (255, 0, 0),  # White / Red
+    "Tip": (244, 35, 232),  # fuchsia
+    "Nacelle": (100, 100, 100),  # Grey
+    "Tower": (102, 102, 156),  # Violet
+    "Blade": (216, 191, 216),  # Thistle
+}
+
+label_colormap_binary = {
+    "Background": (0, 0, 0),
+    "Foreground": (255, 255, 255),
+}
+
+id2labelMulticlass = [
+    'Background',
+    'Hub',
+    'Tip',
+    'Nacelle',
+    'Tower',
+    'Blade'
+]
+
+label2IdMulticlass = {label: class_id for class_id, label in enumerate(id2labelMulticlass)}
+
+id2labelBinary = [
+    'Background',
+    'Foreground'
+]
+
+evals_to_plot = {'iou_class': {'filename': 'iou',
+                               'title': "IoU per class",
+                               'ylab': 'IoU'},
+                 'avg_loss_per_class': {'filename': 'avg_loss',
+                                        'title': "Loss per class",
+                                        'ylab': 'Loss'},
+                 }
+
+id2labelMulticlassAnnot = [
+    'background',
+    'hub',
+    'tip',
+    'nacelle',
+    'tower',
+    'blade'
+]
+
+# HSV COLOR RANGE
+colors_range = {
+    'hub': {'lower': [np.array([0, 70, 50]), np.array([170, 70, 50])],
+            'upper': [np.array([10, 255, 255]), np.array([180, 255, 255])]},
+    'tip': {'lower': [np.array([140, 70, 70])],
+            'upper': [np.array([160, 255, 255])]},
+    'nacelle': {'lower': [np.array([0, 0, 75])],
+                'upper': [np.array([125, 132, 128])]},
+    'tower': {'lower': [np.array([100, 70, 70])],
+              'upper': [np.array([140, 255, 255])]},
+    # 'blade': {'lower': [np.array([130, 25, 70])],
+    #           'upper': [np.array([170, 200, 255])]},
+    'blade': {'lower': [np.array([130, 0, 110])],
+              'upper': [np.array([170, 255, 255])]},
+}
+
+draw_colors = {
+    'tip': [(60, 255, 0), (255, 255, 0)],
+    'hub': [(60, 255, 0), (60, 255, 0)],
+    'blade': [(255, 255, 0), (255, 100, 0)]
+}
+
+
+def build_idcolormap_and_label2id(n_classes):
+    id2label = id2labelBinary if n_classes == 2 else id2labelMulticlass
+    label_colormap = label_colormap_binary if n_classes == 2 else label_colormap_multiclass
+    label2id = {label: id for id, label in enumerate(id2label)}
+    idcolormap = [label_colormap[label] for label in id2label]
+
+    return idcolormap, label2id
+
+
+def compute_class_mask(class_to_mask, frame_hsv):
+    # HUB mask compute masks using bounds
+    hub_color_lower_b = colors_range[class_to_mask]['lower']
+    hub_color_upper_b = colors_range[class_to_mask]['upper']
+
+    # compute class mask
+    mask = None
+    for lower_b, upper_b in zip(hub_color_lower_b, hub_color_upper_b):
+        supp_mask = cv2.inRange(frame_hsv, lower_b, upper_b)
+        # mask = mask | supp_mask if mask is not None else supp_mask
+        mask = cv2.bitwise_or(mask, supp_mask, dst=mask) if mask is not None else supp_mask
+
+    return mask
+
+
+def intersect_and_convert_to_gray(segmented_img, mask):
+    masked_frame = cv2.bitwise_and(segmented_img, segmented_img, mask=mask)
+    masked_frame_bgr = cv2.cvtColor(masked_frame, cv2.COLOR_HSV2BGR)
+    masked_frame_gray = cv2.cvtColor(masked_frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    return masked_frame_gray
+
+
+def extract_colorid_map(n_classes):
+    # Compute color map to convert segmentation results to RGB images
+    id2label = id2labelBinary if n_classes == 2 else id2labelMulticlass
+    label_colormap = label_colormap_binary if n_classes == 2 else label_colormap_multiclass
+    idcolormap = [label_colormap[label] for label in id2label]
+    color_id_map = np.array(idcolormap)
+
+    return color_id_map
+
+
+def produce_masked_gray_frame(segmented_image_rgb, class_id, n_classes, from_pred_to_rgb=False):
+    """
+    Produce the masked grayscale frame from the segmentation
+    result for a given class.
+
+    Args:
+        segmented_image_rgb(numpy.array): segmentation result
+        class_id (int): class id
+
+    Returns:
+        masked_frame_gray (numpy.array): grayscale masked version of
+            the segmentation result
+        class_to_mask (str): name of the masked class
+    """
+    segmented_frame = segmented_image_rgb.copy()
+
+    if from_pred_to_rgb:
+        color_id_map = extract_colorid_map(n_classes)
+        segmented_frame = color_id_map[segmented_frame].astype(np.uint8)
+
+    segmented_frame_bgr = cv2.cvtColor(segmented_frame, cv2.COLOR_RGB2BGR)
+
+    segmented_frame_hsv = cv2.cvtColor(segmented_frame_bgr, cv2.COLOR_BGR2HSV)
+    class_to_mask = id2labelMulticlassAnnot[class_id]
+
+    mask = compute_class_mask(class_to_mask, segmented_frame_hsv)
+    masked_frame_gray = intersect_and_convert_to_gray(segmented_frame_bgr, mask)
+
+    # cv2.imshow('segmented frame', segmented_frame_bgr)
+    # cv2.imshow('masked frame', masked_frame_gray)
+    # cv2.waitKey(0)
+
+    return masked_frame_gray, class_to_mask
