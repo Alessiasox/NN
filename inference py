@@ -1,0 +1,101 @@
+import tensorflow as tf
+import numpy as np
+import cv2
+
+from erfnet_tf.model_structure.classes_metadata import id2labelBinary, id2labelMulticlass, label_colormap_multiclass, \
+    label_colormap_binary
+from erfnet_tf.utils.load_models_utils import load_graph
+from erfnet_tf.model_structure.model_base import SegmentationModel
+from erfnet_tf.model_structure.erfnet import erfnetB
+
+from common.fgextractor_interface import FGextractor
+from common.tf_utils import get_tf_session
+
+
+class ErfnetFGextractor(FGextractor):
+
+
+    def __init__(self, config):
+        fg_extractor_config = config['foreground_extractor']
+        self.enabled = fg_extractor_config['enabled']
+
+        # model_path is the folder in which the model is stored
+        self.model_path = fg_extractor_config['model_path']
+        # model_name is the name of the folder in which the snapshot is stored
+        self.model_name = fg_extractor_config['model_name']
+        self.model_width = fg_extractor_config['model_width']
+        self.model_height = fg_extractor_config['model_height']
+        self.n_classes = fg_extractor_config['n_classes']
+        self.model_input_shape = (self.model_width, self.model_height)
+        self.init_image_path = fg_extractor_config['init_image_path']
+
+        extractor = SegmentationModel(self.model_name, img_shape=[self.model_width, self.model_height],
+                                      n_classes=self.n_classes, l2=2e-4, model_path=self.model_path)
+
+        self.frozen = fg_extractor_config['frozen_model']
+        if fg_extractor_config['frozen_model']:
+            graph = load_graph(fg_extractor_config["frozen_model_filename"])
+            extractor.graph = graph
+            # sess = tf.compat.v1.Session(graph=extractor.graph)
+            sess = get_tf_session(graph=extractor.graph, allow_growth=True)
+
+        else:
+            extractor.create_graph(erfnetB)
+            sess = get_tf_session(graph=extractor.graph, allow_growth=True)
+            extractor.initialize_vars(sess, best=True)
+
+        # initialize vars with the trained model
+        self.model = extractor
+        self.sess = sess
+
+        id2label = id2labelBinary if self.n_classes == 2 else id2labelMulticlass
+        label_colormap = label_colormap_binary if self.n_classes == 2 else label_colormap_multiclass
+        self.idcolormap = [label_colormap[label] for label in id2label]
+
+    def get_model_input_shape(self):
+        """Retrieve the Tensorflow's model input shape"""
+        return self.model_input_shape
+
+    def model_predict_single(self, sample, frozen=False):
+        """Compute the prediction on the sample passed as argument"""
+        if frozen:
+            preds = self.model.predict_single_frame_frozen(X=sample, session=self.sess,
+                                                           graph=self.model.graph)
+        else:
+            preds = self.model.predict_single_frame(sample, self.sess)
+
+        preds = preds.squeeze()
+        # just foreground background: convert all the classes related to the wt to
+        # 1, background 0
+        # mask = preds != 0
+        # preds[mask] = 1
+        return preds
+
+    def extract_foreground(self, image_rgb, frozen):
+        """Compute the image pre-processing and wrap all the functions to perform the inference"""
+        """ Extract foreground from image.
+
+                This function takes one colored image in input and predicts its masks. After that it uses background_sub to
+                extract foreground.
+
+                :param image: The input colored image.
+                :return: A copy of the input image with background colored in gray.
+                """
+
+        fg_extractor_shape = self.get_model_input_shape()
+        fg_extractor_frame = cv2.resize(image_rgb, (fg_extractor_shape[0], fg_extractor_shape[1]))
+        fg_extractor_frame = fg_extractor_frame.reshape(
+            (1, fg_extractor_frame.shape[0], fg_extractor_frame.shape[1], fg_extractor_frame.shape[2]))
+        fg_extractor_frame = self.model_predict_single(fg_extractor_frame, frozen=frozen)
+        x = np.array(self.idcolormap)
+        fg_extractor_frame = x[fg_extractor_frame].astype(np.uint8)
+        processed = np.uint8(fg_extractor_frame)
+        return processed
+
+    def get_img_format(self):
+        """ Get image format for this extractor"""
+        return "RGB"
+
+    def load_full_model(self):
+        img = np.zeros((self.model_height, self.model_width, 3))
+        self.model_predict_single([img], frozen=self.frozen)
