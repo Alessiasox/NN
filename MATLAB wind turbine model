@@ -1,0 +1,124 @@
+MATLAB 
+
+Turbine Model Parameterisation
+%Either ask the user to input the parameters:
+% c = str2num(char(inputdlg('Enter the 2D location of the turbine’s base on the xy plane [m]: ')));
+% h = str2num(char(inputdlg('Enter the height of the turbine’s tower [m]: ')));
+% w = str2num(char(inputdlg('Enter the heading of the turbine relative to the drone’s coordinate system [deg]: ')));
+% r = str2num(char(inputdlg('Enter the length of the turbine nacelle which joins the top of the turbine tower with the blade centre [m]: ')));
+% phi=str2num(char(inputdlg('Enter the rotation angle of the turbine blades [deg]: ')));
+% b = str2num(char(inputdlg('Enter the length of the turbine blades: [m] ')));
+% Teta_par=[c,h,w,r,phi,b];
+%Or, alternatively, set the values here:
+c=[0;0]; %%2D   %      The 2D location of the turbine,s base on the xy plane
+h=100;      %[m]   The height of the turbine’s tower
+w=20*pi/180;       %[rad] The heading of the turbine relative to the droners
+            %      coordinate system
+beta=30*pi/180;    %[rad] Variation angle from the heading
+r=30;       %[m]   The length of the turbine nacelle which joins the top of
+           %      the turbine tower with the blade centre
+phi1=0; %60*pi/180;    %[rad] The rotation angle of the turbine blades
+phi2=phi1+120*pi/180;
+phi3=phi2+120*pi/180;
+b=20;       %[m]   The length of the turbine blades
+theta=5*pi/180;    % [rad] nacelle angle wrt horizon
+theta1=6*pi/180;
+chi = 5*pi/180;  % [rad] rotation angle of blades wrt to nacelle perpendicular plane
+Initialisation
+%The point model consists of a set of six points initialised to the
+%following values:
+pg0= [0,0,0]'; %ground point
+pt0= [0,0,1]'; %top of the turbine tower;
+pr0= [1,0,1]'; %center of the turbine blades;
+pb_i0=[1,0,2]'; %three tips of the blades
+%According to the "default" model, the tower is of unit height,
+%the blades are of unit length, and the heading is oriented along the x-axis
+
+Mh = [1,0,0;
+      0,1,0;
+      0,0,h];                   %scales the input point along the z-axis.
+Mr = [r,0,0;
+      0,1,0;
+      0,0,1];                   %scales the input point along the x-axis
+Mr_plus = [r+b*sin(beta),0,0;
+           0,1,0;
+           0,0,1];              %scales the input point along the x-axis
+Rw = [cos(w), -sin(w),0;        %rotates the scaled points around the z-axis by an angle of ω
+      sin(w),  cos(w),0;
+      0,0,1];
+Rw_plus = [cos(w+beta), -sin(w+beta),0;           %rotates the scaled points around the z-axis by an angle of ω
+           sin(w+beta),cos(w+beta),0;
+           0,0,1];
+Rw_minus = [cos(w-beta), -sin(w-beta),0;        %rotates the scaled points around the z-axis by an angle of ω
+            sin(w-beta),cos(w-beta),0;
+            0,0,1];
+Mb = [1,0,0;
+      0,1,0;
+      0,0,b];                       %scales the length of the blades along the z-axis
+Rphi1= [1,0,0;
+       0, cos(phi1), -sin(phi1);      %rotates the blades around the x-axis by phi (levato 1 dalla posizione 2x1)
+       0, sin(phi1),  cos(phi1)];
+Rphi2= [1,0,0;
+       0, cos(phi2), -sin(phi2);    %rotates the blades around the x-axis by phi+120 (levato 1 dalla posizione 2x1)
+       0, sin(phi2),  cos(phi2)];
+Rphi3= [1,0,0;
+       0, cos(phi3), -sin(phi3);    %rotates the blades around the x-axis by phi+120 (levato 1 dalla posizione 2x1)
+       0, sin(phi3),  cos(phi3)];
+Rtheta = [cos(theta), 0, -sin(theta);  % rotates the nacelle by theta aroud y axis
+          0, 1, 0;
+          sin(theta), 0, cos(theta)];
+Rtheta1 = [cos(theta1), 0, -sin(theta1);  % rotates the nacelle by theta aroud y axis
+          0, 1, 0;
+          sin(theta1), 0, cos(theta1)];
+Defining the points
+pc= [c;0];
+pg = pc+pg0;
+pt=pc+Mh*pt0;
+pr=pc+Rtheta*Rw*Mr*Mh*pr0;
+
+
+k = b*[sin(chi);0;0];
+
+ pb_1=pc+Mh*pt0+Rw*Mr*(Rphi1*Mb*(pb_i0-pt0)); %%%% pt0 not pt %%%%
+  pb_2=pc+Mh*pt0+Rw*Mr*(Rphi2*Mb*(pb_i0-pt0));
+  pb_3=pc+Mh*pt0+Rw*Mr*(Rphi3*Mb*(pb_i0-pt0));
+
+%   pb_1=pc+Mh*pt0+Rtheta1*Rw*Mr*(Rphi1*Mb*(pb_i0-pt0)); %%%% pt0 not pt %%%%
+%   pb_2=pc+Mh*pt0+Rtheta1*Rw*Mr*(Rphi2*Mb*(pb_i0-pt0));
+%   pb_3=pc+Mh*pt0+Rtheta1*Rw*Mr*(Rphi3*Mb*(pb_i0-pt0));
+
+a1 = Rw*Mr*(Rphi1*Mb*(pb_i0-pt0));
+a2 = Rw*Mr*(Rphi2*Mb*(pb_i0-pt0));
+a3 = Rw*Mr*(Rphi3*Mb*(pb_i0-pt0));
+b = Mh*pt0;
+c = pc;
+
+%+Rw*Mr*(Rphi1*Mb(pb_i0-pt0))
+
+%pb_1=pc+Rw*Mr_plus*Rphi1*Mb*pb_i0+Rw*Mr_plus*(1-Rphi1*Mb)*pt0;
+Plotting
+ point1 = pg;
+ point2 = pt;
+ point3 = pr;
+ point4 = pb_1;
+ point5= pb_2;
+ point6= pb_3;
+origin = [c;0;0];
+figure;hold on;
+ plot3([origin(1) point1(1)],[origin(2) point1(2)],[origin(3) point1(3)],'LineWidth',5,'Color','b');
+ plot3([point1(1) point2(1)],[point1(2) point2(2)],[point1(3) point2(3)],'LineWidth',5, 'Color','r');
+ plot3([point2(1) point3(1)],[point2(2) point3(2)],[point2(3) point3(3)],'LineWidth',5, 'Color','g');
+ plot3([point3(1) point4(1)],[point3(2) point4(2)],[point3(3) point4(3)],'LineWidth',5, 'Color','b');
+ plot3([point3(1) point5(1)],[point3(2) point5(2)],[point3(3) point5(3)],'LineWidth',5, 'Color','b');
+ plot3([point3(1) point6(1)],[point3(2) point6(2)],[point3(3) point6(3)],'LineWidth',5, 'Color','b');
+
+
+grid on;
+axis equal
+xlim([-150, 150])
+ylim([-150, 150])
+zlim([0, 150])
+xlabel('X');
+ylabel('Y');
+zlabel('Z');
+set(gca,'CameraPosition',[2 2 2]);
