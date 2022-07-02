@@ -1,0 +1,105 @@
+
+
+from pathlib import Path
+
+import json5
+import numpy as np
+import tensorflow as tf
+from argparse import ArgumentParser
+import sys
+import os
+import shutil
+import warnings
+
+from erfnet_tf.utils.image_processing import create_augmentation_func_for_segmentation
+
+# "Try" import for deployment project, "else" import for training
+try:
+    from erfnet_tf.utils import prepare_data, calculate_class_weights
+    from erfnet_tf.model_structure import SegmentationModel
+    from erfnet_tf.model_structure import erfnetA, erfnetB
+except ImportError:
+    from erfnet_tf.utils import prepare_data, calculate_class_weights
+    from erfnet_tf.model_structure import SegmentationModel
+    from erfnet_tf.model_structure import erfnetA, erfnetB
+
+# suppress TF warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+warnings.simplefilter("ignore")
+
+# set current working directory
+cur_dir = os.getcwd()
+os.chdir(cur_dir)
+sys.path.append(cur_dir)
+
+# set seed of random number generator
+np.random.seed(1)
+tf.set_random_seed(2)
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+# ##############################################################################
+#                                    MAIN                                      #
+# ##############################################################################
+if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument('--config', required=True)
+    args = parser.parse_args()
+    config = json5.load(open(args.config, 'r'))
+    aug_function_config = json5.load(open(config['aug_function_config_path'], 'r'))
+
+    # ------------ Data loading ------------
+    DATA_LIMIT = config['data_limit']
+    n_valid = config["nValid"]
+    data_file = config['dataFile']
+    n_classes_for_data = config["nClasses"]
+
+    data = prepare_data(data_file, valid_from_train=False, n_valid=n_valid, max_data=DATA_LIMIT,
+                        n_classes=n_classes_for_data)
+
+    # ------------ Model Instantiation ------------
+    model_path = config['model_path']
+    model_name = config["modelName"]
+    img_shape = config["shape"]
+    n_classes = config["nClasses"]
+
+    model = SegmentationModel(model_name, model_path=model_path, img_shape=img_shape, n_classes=n_classes, l2=2e-4,
+                              alpha=config["alpha"], batch_size=config["batchSize"], do_inference=False)
+    class_weights = calculate_class_weights(data["Y_train"], n_classes=n_classes, method="paszke", c=1.10)
+    model.set_class_weights(class_weights)
+    model.create_graph(erfnetB)
+
+    # ------------ Training procedure ------------
+    # Instantiate augmentation function
+    aug_func = create_augmentation_func_for_segmentation(
+        shadow=tuple(aug_function_config["shadow"]),
+        shadow_file=aug_function_config["shadow_file"],
+        shadow_crop_range=tuple(aug_function_config["shadow_crop_range"]),
+        rotate=aug_function_config["rotate"],
+        crop=aug_function_config["crop"],
+        lr_flip=aug_function_config["lr_flip"],
+        tb_flip=aug_function_config["tb_flip"],
+        brightness=tuple(aug_function_config["brightness"]),
+        contrast=tuple(aug_function_config["contrast"]),
+        blur=aug_function_config["blur"],
+        noise=aug_function_config["noise"]
+    )
+    aug_func = aug_func if config["aug_online"] else None
+
+    # Reading training parameters
+    numEpochs = config["numEpochs"]
+    printEvery = config["printEvery"]
+    batchSize = config["batchSize"]
+    n_perm = config["n_perm"]
+    alpha = config["alpha"]
+    dropout = config["dropout"]
+    l2 = config["l2"]
+    vizEvery = config["vizEvery"]
+    worse_pred = config["worsePredSamples"]
+
+    # copy config to model path
+    shutil.copy(args.config, Path(model_path) / Path(args.config).name)
+
+    # TRAIN
+    model.train(data, n_epochs=numEpochs, print_every=printEvery, batch_size=batchSize, n_perm=n_perm, alpha=alpha,
+                dropout=dropout, l2=l2, aug_func=aug_func, viz_every=vizEvery, worse_pred=worse_pred)
